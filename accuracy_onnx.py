@@ -2,19 +2,16 @@ import os
 import argparse
 import numpy as np
 import onnxruntime as ort
-import torch
-from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 
-def eval_onnx_accuracy(model_path, batch_size=64, num_workers=2):
+def eval_onnx_accuracy(model_path):
     tfm = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
     ])
 
     test_ds = datasets.CIFAR10(root="data", train=False, download=True, transform=tfm)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     input_name = sess.get_inputs()[0].name
@@ -22,14 +19,14 @@ def eval_onnx_accuracy(model_path, batch_size=64, num_workers=2):
     correct = 0
     total = 0
 
-    for x, y in test_loader:
-        x_np = x.numpy().astype(np.float32)
+    for x, y in test_ds:
+        x_np = x.unsqueeze(0).numpy().astype(np.float32)  
 
-        out = sess.run(None, {input_name: x_np})[0]  
-        preds = np.argmax(out, axis=1)
+        out = sess.run(None, {input_name: x_np})[0]       
+        pred = int(np.argmax(out, axis=1)[0])
 
-        correct += int((preds == y.numpy()).sum())
-        total += y.size(0)
+        correct += int(pred == y)
+        total += 1
 
     return correct / total
 
