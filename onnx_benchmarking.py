@@ -19,9 +19,18 @@ def get_cpu_temp():
 
 
 def run_stage(sess, input_name, dummy, runs, sleep_s=0.0):
-    """Run a timed inference stage and collect latency + temperature trace."""
+    """
+    Run a timed inference stage and collect:
+    - latency list
+    - temp trace (if available)
+    - CPU utilization trace
+    Returns averages + maxes + traces.
+    """
     times = []
     temp_trace = []
+    cpu_trace = []
+
+    psutil.cpu_percent(interval=None)
 
     for _ in range(runs):
         start = time.perf_counter()
@@ -29,8 +38,8 @@ def run_stage(sess, input_name, dummy, runs, sleep_s=0.0):
         end = time.perf_counter()
         times.append(end - start)
 
-        t = get_cpu_temp()
-        temp_trace.append(t)
+        temp_trace.append(get_cpu_temp())
+        cpu_trace.append(psutil.cpu_percent(interval=None))
 
         if sleep_s > 0:
             time.sleep(sleep_s)
@@ -42,7 +51,10 @@ def run_stage(sess, input_name, dummy, runs, sleep_s=0.0):
     temp_avg = float(np.mean(temps_valid)) if temps_valid else None
     temp_max = float(np.max(temps_valid)) if temps_valid else None
 
-    return avg_latency_ms, fps, temp_avg, temp_max, temp_trace
+    cpu_avg = float(np.mean(cpu_trace)) if cpu_trace else None
+    cpu_max = float(np.max(cpu_trace)) if cpu_trace else None
+
+    return avg_latency_ms, fps, temp_avg, temp_max, temp_trace, cpu_avg, cpu_max, cpu_trace
 
 
 def save_csv(path, results, fieldnames):
@@ -64,25 +76,27 @@ def bar_plot(filename, title, ylabel, models, values):
     print(f"Saved {filename}")
 
 
-def temp_overlay_plot(filename, title, models, temp_traces):
+def overlay_plot(filename, title, xlabel, ylabel, models, traces_dict):
+    """Generic overlay plot for traces (e.g., temperature, CPU%)."""
     plt.figure()
-    any_temp = False
+    any_data = False
     for m in models:
-        trace = temp_traces.get(m, [])
-        if trace and any(t is not None for t in trace):
-            y = [t if t is not None else np.nan for t in trace]
-            plt.plot(y, label=m)
-            any_temp = True
+        trace = traces_dict.get(m, [])
+        if trace:
+            y = [v if v is not None else np.nan for v in trace]
+            if any(np.isfinite(yv) for yv in y):
+                plt.plot(y, label=m)
+                any_data = True
 
-    plt.xlabel("Inference iteration")
-    plt.ylabel("CPU Temperature (°C)")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
     plt.title(title)
-    if any_temp:
+    if any_data:
         plt.legend()
     else:
         plt.text(
             0.5, 0.5,
-            "CPU temperature unavailable (vcgencmd not found)",
+            "Data unavailable",
             ha="center", va="center",
             transform=plt.gca().transAxes,
         )
@@ -110,8 +124,12 @@ def main(models_dir, runs_short, runs_long, warmup, threads, sleep_s):
 
     results_50 = []
     results_200 = []
+
     temp_traces_50 = {}
     temp_traces_200 = {}
+
+    cpu_traces_50 = {}
+    cpu_traces_200 = {}
 
     for fname in onnx_files:
         path = os.path.join(models_dir, fname)
@@ -124,19 +142,22 @@ def main(models_dir, runs_short, runs_long, warmup, threads, sleep_s):
         for _ in range(warmup):
             sess.run(None, {input_name: dummy})
 
-        # Stage 50
-        lat50, fps50, tavg50, tmax50, trace50 = run_stage(sess, input_name, dummy, runs_short, sleep_s)
-        # Stage 200
-        lat200, fps200, tavg200, tmax200, trace200 = run_stage(sess, input_name, dummy, runs_long, sleep_s)
+        lat50, fps50, tavg50, tmax50, traceT50, cpuavg50, cpumax50, traceC50 = run_stage(
+            sess, input_name, dummy, runs_short, sleep_s
+        )
+        
+        lat200, fps200, tavg200, tmax200, traceT200, cpuavg200, cpumax200, traceC200 = run_stage(
+            sess, input_name, dummy, runs_long, sleep_s
+        )
 
-        cpu_now = psutil.cpu_percent()
-        ram_now = psutil.virtual_memory().percent
+        ram_now = psutil.virtual_memory().percent  
 
         results_50.append({
             "model": fname,
             "latency_ms": lat50,
             "fps": fps50,
-            "cpu_percent": cpu_now,
+            "cpu_avg_percent": cpuavg50,
+            "cpu_max_percent": cpumax50,
             "ram_percent": ram_now,
             "temp_avg_c": tavg50,
             "temp_max_c": tmax50,
@@ -145,44 +166,59 @@ def main(models_dir, runs_short, runs_long, warmup, threads, sleep_s):
             "model": fname,
             "latency_ms": lat200,
             "fps": fps200,
-            "cpu_percent": cpu_now,
+            "cpu_avg_percent": cpuavg200,
+            "cpu_max_percent": cpumax200,
             "ram_percent": ram_now,
             "temp_avg_c": tavg200,
             "temp_max_c": tmax200,
         })
 
-        temp_traces_50[fname] = trace50
-        temp_traces_200[fname] = trace200
+        temp_traces_50[fname] = traceT50
+        temp_traces_200[fname] = traceT200
+        cpu_traces_50[fname] = traceC50
+        cpu_traces_200[fname] = traceC200
 
         def fmt(x):
             return "NA" if x is None else f"{x:.2f}"
 
-        print(f"  [50 ] Avg Latency: {lat50:.2f} ms | FPS: {fps50:.2f} | Temp(avg/max): {fmt(tavg50)}/{fmt(tmax50)} °C")
-        print(f"  [200] Avg Latency: {lat200:.2f} ms | FPS: {fps200:.2f} | Temp(avg/max): {fmt(tavg200)}/{fmt(tmax200)} °C\n")
+        print(f"  [50 ] Latency: {lat50:.2f} ms | FPS: {fps50:.2f} | CPU(avg/max): {fmt(cpuavg50)}/{fmt(cpumax50)}% | Temp(avg/max): {fmt(tavg50)}/{fmt(tmax50)} °C")
+        print(f"  [200] Latency: {lat200:.2f} ms | FPS: {fps200:.2f} | CPU(avg/max): {fmt(cpuavg200)}/{fmt(cpumax200)}% | Temp(avg/max): {fmt(tavg200)}/{fmt(tmax200)} °C\n")
 
-    fieldnames = ["model", "latency_ms", "fps", "cpu_percent", "ram_percent", "temp_avg_c", "temp_max_c"]
+    fieldnames = [
+        "model", "latency_ms", "fps",
+        "cpu_avg_percent", "cpu_max_percent",
+        "ram_percent",
+        "temp_avg_c", "temp_max_c"
+    ]
 
-    # Save CSVs
     save_csv("benchmark_results_50.csv", results_50, fieldnames)
     save_csv("benchmark_results_200.csv", results_200, fieldnames)
 
-    # Plot bars (50)
     models = [r["model"] for r in results_50]
     lat50_vals = [r["latency_ms"] for r in results_50]
     fps50_vals = [r["fps"] for r in results_50]
+    cpuavg50_vals = [r["cpu_avg_percent"] if r["cpu_avg_percent"] is not None else 0.0 for r in results_50]
+
     bar_plot("latency_plot_50.png", "ONNX Runtime Inference Latency (50-run avg)", "Latency (ms)", models, lat50_vals)
     bar_plot("fps_plot_50.png", "ONNX Runtime Throughput (50-run avg)", "Throughput (FPS)", models, fps50_vals)
-    temp_overlay_plot("temperature_plot_50.png", "Temperature During Inference (50 runs)", models, temp_traces_50)
+    bar_plot("cpu_avg_plot_50.png", "CPU Utilization (50-run avg)", "CPU Utilization (%)", models, cpuavg50_vals)
 
-    # Plot bars (200)
+    overlay_plot("temperature_plot_50.png", "Temperature During Inference (50 runs)", "Inference iteration", "CPU Temperature (°C)", models, temp_traces_50)
+    overlay_plot("cpu_trace_plot_50.png", "CPU Utilization Trace (50 runs)", "Inference iteration", "CPU Utilization (%)", models, cpu_traces_50)
+
     models200 = [r["model"] for r in results_200]
     lat200_vals = [r["latency_ms"] for r in results_200]
     fps200_vals = [r["fps"] for r in results_200]
+    cpuavg200_vals = [r["cpu_avg_percent"] if r["cpu_avg_percent"] is not None else 0.0 for r in results_200]
+
     bar_plot("latency_plot_200.png", "ONNX Runtime Inference Latency (200-run avg)", "Latency (ms)", models200, lat200_vals)
     bar_plot("fps_plot_200.png", "ONNX Runtime Throughput (200-run avg)", "Throughput (FPS)", models200, fps200_vals)
-    temp_overlay_plot("temperature_plot_200.png", "Temperature During Inference (200 runs)", models200, temp_traces_200)
+    bar_plot("cpu_avg_plot_200.png", "CPU Utilization (200-run avg)", "CPU Utilization (%)", models200, cpuavg200_vals)
 
-    print("\nDone. Generated CSVs and plots for both 50 and 200 runs.")
+    overlay_plot("temperature_plot_200.png", "Temperature During Inference (200 runs)", "Inference iteration", "CPU Temperature (°C)", models200, temp_traces_200)
+    overlay_plot("cpu_trace_plot_200.png", "CPU Utilization Trace (200 runs)", "Inference iteration", "CPU Utilization (%)", models200, cpu_traces_200)
+
+    print("\nDone. Generated CSVs and plots for both 50 and 200 runs (including CPU utilization).")
 
 
 if __name__ == "__main__":
