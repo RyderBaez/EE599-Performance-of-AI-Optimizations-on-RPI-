@@ -1,6 +1,3 @@
-# Run ONNX Runtime benchmarks for all .onnx files in a directory on Raspberry Pi,
-# save CSV + latency/FPS plots + temperature-over-time plot.
-
 import time
 import os
 import csv
@@ -21,18 +18,8 @@ def get_cpu_temp():
         return None
 
 
-def benchmark_onnx(model_path, runs=50, warmup=10, input_shape=(1, 3, 224, 224), sleep_s=0.0):
-    """
-    Benchmarks a single ONNX model with ONNX Runtime on CPU.
-    Returns summary stats plus a temp trace (if available).
-    """
-    sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-    input_name = sess.get_inputs()[0].name
-    dummy = np.random.randn(*input_shape).astype(np.float32)
-
-    for _ in range(warmup):
-        sess.run(None, {input_name: dummy})
-
+def run_stage(sess, input_name, dummy, runs, sleep_s=0.0):
+    """Run a timed inference stage and collect latency + temperature trace."""
     times = []
     temp_trace = []
 
@@ -55,18 +42,56 @@ def benchmark_onnx(model_path, runs=50, warmup=10, input_shape=(1, 3, 224, 224),
     temp_avg = float(np.mean(temps_valid)) if temps_valid else None
     temp_max = float(np.max(temps_valid)) if temps_valid else None
 
-    return {
-        "latency_ms": avg_latency_ms,
-        "fps": fps,
-        "cpu_percent": psutil.cpu_percent(),
-        "ram_percent": psutil.virtual_memory().percent,
-        "temp_avg_c": temp_avg,
-        "temp_max_c": temp_max,
-        "temp_trace": temp_trace,
-    }
+    return avg_latency_ms, fps, temp_avg, temp_max, temp_trace
 
 
-def main(models_dir, runs, warmup, threads, sleep_s):
+def save_csv(path, results, fieldnames):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"Saved results to {path}")
+
+
+def bar_plot(filename, title, ylabel, models, values):
+    plt.figure()
+    plt.bar(models, values)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+    plt.savefig(filename)
+    print(f"Saved {filename}")
+
+
+def temp_overlay_plot(filename, title, models, temp_traces):
+    plt.figure()
+    any_temp = False
+    for m in models:
+        trace = temp_traces.get(m, [])
+        if trace and any(t is not None for t in trace):
+            y = [t if t is not None else np.nan for t in trace]
+            plt.plot(y, label=m)
+            any_temp = True
+
+    plt.xlabel("Inference iteration")
+    plt.ylabel("CPU Temperature (°C)")
+    plt.title(title)
+    if any_temp:
+        plt.legend()
+    else:
+        plt.text(
+            0.5, 0.5,
+            "CPU temperature unavailable (vcgencmd not found)",
+            ha="center", va="center",
+            transform=plt.gca().transAxes,
+        )
+    plt.tight_layout()
+    plt.savefig(filename)
+    print(f"Saved {filename}")
+
+
+def main(models_dir, runs_short, runs_long, warmup, threads, sleep_s):
     so = ort.SessionOptions()
     if threads is not None:
         so.intra_op_num_threads = threads
@@ -76,15 +101,17 @@ def main(models_dir, runs, warmup, threads, sleep_s):
     if not onnx_files:
         raise RuntimeError(f"No .onnx files found in: {models_dir}")
 
-    results = []
-    temp_traces = {}
-
     print("===================================")
     print("   Raspberry Pi ONNX Benchmark All")
     print("===================================")
     print(f"Models dir: {models_dir}")
-    print(f"Runs:       {runs}   Warmup: {warmup}   Threads: {threads}   Sleep: {sleep_s}s")
+    print(f"Warmup: {warmup} | Runs(50): {runs_short} | Runs(200): {runs_long} | Threads: {threads} | Sleep: {sleep_s}s")
     print("===================================\n")
+
+    results_50 = []
+    results_200 = []
+    temp_traces_50 = {}
+    temp_traces_200 = {}
 
     for fname in onnx_files:
         path = os.path.join(models_dir, fname)
@@ -97,104 +124,75 @@ def main(models_dir, runs, warmup, threads, sleep_s):
         for _ in range(warmup):
             sess.run(None, {input_name: dummy})
 
-        times = []
-        temp_trace = []
+        # Stage 50
+        lat50, fps50, tavg50, tmax50, trace50 = run_stage(sess, input_name, dummy, runs_short, sleep_s)
+        # Stage 200
+        lat200, fps200, tavg200, tmax200, trace200 = run_stage(sess, input_name, dummy, runs_long, sleep_s)
 
-        for _ in range(runs):
-            start = time.perf_counter()
-            sess.run(None, {input_name: dummy})
-            end = time.perf_counter()
-            times.append(end - start)
+        cpu_now = psutil.cpu_percent()
+        ram_now = psutil.virtual_memory().percent
 
-            t = get_cpu_temp()
-            temp_trace.append(t)
-
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-
-        avg_latency_ms = float(np.mean(times) * 1000.0)
-        fps = float(1000.0 / avg_latency_ms) if avg_latency_ms > 0 else float("inf")
-
-        temps_valid = [t for t in temp_trace if t is not None]
-        temp_avg = float(np.mean(temps_valid)) if temps_valid else None
-        temp_max = float(np.max(temps_valid)) if temps_valid else None
-
-        row = {
+        results_50.append({
             "model": fname,
-            "latency_ms": avg_latency_ms,
-            "fps": fps,
-            "cpu_percent": psutil.cpu_percent(),
-            "ram_percent": psutil.virtual_memory().percent,
-            "temp_avg_c": temp_avg,
-            "temp_max_c": temp_max,
-        }
-        results.append(row)
-        temp_traces[fname] = temp_trace
+            "latency_ms": lat50,
+            "fps": fps50,
+            "cpu_percent": cpu_now,
+            "ram_percent": ram_now,
+            "temp_avg_c": tavg50,
+            "temp_max_c": tmax50,
+        })
+        results_200.append({
+            "model": fname,
+            "latency_ms": lat200,
+            "fps": fps200,
+            "cpu_percent": cpu_now,
+            "ram_percent": ram_now,
+            "temp_avg_c": tavg200,
+            "temp_max_c": tmax200,
+        })
 
-        print(f"  Avg Latency: {avg_latency_ms:.2f} ms | FPS: {fps:.2f} | "
-              f"Temp(avg/max): {temp_avg if temp_avg is not None else 'NA'}/"
-              f"{temp_max if temp_max is not None else 'NA'} °C\n")
+        temp_traces_50[fname] = trace50
+        temp_traces_200[fname] = trace200
 
-    csv_path = "benchmark_results.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["model", "latency_ms", "fps", "cpu_percent", "ram_percent", "temp_avg_c", "temp_max_c"],
-        )
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"Saved results to {csv_path}")
+        def fmt(x):
+            return "NA" if x is None else f"{x:.2f}"
 
-    models = [r["model"] for r in results]
-    latency = [r["latency_ms"] for r in results]
-    fps_vals = [r["fps"] for r in results]
+        print(f"  [50 ] Avg Latency: {lat50:.2f} ms | FPS: {fps50:.2f} | Temp(avg/max): {fmt(tavg50)}/{fmt(tmax50)} °C")
+        print(f"  [200] Avg Latency: {lat200:.2f} ms | FPS: {fps200:.2f} | Temp(avg/max): {fmt(tavg200)}/{fmt(tmax200)} °C\n")
 
-    plt.figure()
-    plt.bar(models, latency)
-    plt.ylabel("Latency (ms)")
-    plt.title("ONNX Runtime Inference Latency on Raspberry Pi")
-    plt.xticks(rotation=30, ha="right")
-    plt.tight_layout()
-    plt.savefig("latency_plot.png")
+    fieldnames = ["model", "latency_ms", "fps", "cpu_percent", "ram_percent", "temp_avg_c", "temp_max_c"]
 
-    plt.figure()
-    plt.bar(models, fps_vals)
-    plt.ylabel("Throughput (FPS)")
-    plt.title("ONNX Runtime Throughput on Raspberry Pi")
-    plt.xticks(rotation=30, ha="right")
-    plt.tight_layout()
-    plt.savefig("fps_plot.png")
-  
-    plt.figure()
-    any_temp = False
-    for m in models:
-        trace = temp_traces.get(m, [])
-        if trace and any(t is not None for t in trace):
-            y = [t if t is not None else np.nan for t in trace]
-            plt.plot(y, label=m)
-            any_temp = True
+    # Save CSVs
+    save_csv("benchmark_results_50.csv", results_50, fieldnames)
+    save_csv("benchmark_results_200.csv", results_200, fieldnames)
 
-    plt.xlabel("Inference iteration")
-    plt.ylabel("CPU Temperature (°C)")
-    plt.title("Raspberry Pi Temperature During Inference")
-    if any_temp:
-        plt.legend()
-    else:
-        plt.text(0.5, 0.5, "CPU temperature unavailable (vcgencmd not found)",
-                 ha="center", va="center", transform=plt.gca().transAxes)
-    plt.tight_layout()
-    plt.savefig("temperature_plot.png")
+    # Plot bars (50)
+    models = [r["model"] for r in results_50]
+    lat50_vals = [r["latency_ms"] for r in results_50]
+    fps50_vals = [r["fps"] for r in results_50]
+    bar_plot("latency_plot_50.png", "ONNX Runtime Inference Latency (50-run avg)", "Latency (ms)", models, lat50_vals)
+    bar_plot("fps_plot_50.png", "ONNX Runtime Throughput (50-run avg)", "Throughput (FPS)", models, fps50_vals)
+    temp_overlay_plot("temperature_plot_50.png", "Temperature During Inference (50 runs)", models, temp_traces_50)
 
-    print("Saved latency_plot.png, fps_plot.png, temperature_plot.png")
+    # Plot bars (200)
+    models200 = [r["model"] for r in results_200]
+    lat200_vals = [r["latency_ms"] for r in results_200]
+    fps200_vals = [r["fps"] for r in results_200]
+    bar_plot("latency_plot_200.png", "ONNX Runtime Inference Latency (200-run avg)", "Latency (ms)", models200, lat200_vals)
+    bar_plot("fps_plot_200.png", "ONNX Runtime Throughput (200-run avg)", "Throughput (FPS)", models200, fps200_vals)
+    temp_overlay_plot("temperature_plot_200.png", "Temperature During Inference (200 runs)", models200, temp_traces_200)
+
+    print("\nDone. Generated CSVs and plots for both 50 and 200 runs.")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--models_dir", default="Models/Baseline", help="Directory containing ONNX models")
-    ap.add_argument("--runs", type=int, default=50)
+    ap.add_argument("--runs_short", type=int, default=50, help="Short benchmark runs (default 50)")
+    ap.add_argument("--runs_long", type=int, default=200, help="Long benchmark runs (default 200)")
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--threads", type=int, default=None, help="Set intra-op threads (optional)")
     ap.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between runs (optional)")
     args = ap.parse_args()
 
-    main(args.models_dir, args.runs, args.warmup, args.threads, args.sleep)
+    main(args.models_dir, args.runs_short, args.runs_long, args.warmup, args.threads, args.sleep)
